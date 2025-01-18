@@ -1,0 +1,55 @@
+from aiogram.utils import executor
+from datetime import datetime
+
+# Токен бота
+BOT_TOKEN = 7926233927:AAFjSBeFDgrjENeTb-d8pxvUfb0hlv9YF94
+
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
+# Хранилище данных
+participants = {}
+start_date = None
+end_date = None
+
+@dp.message_handler(commands=["start_challenge"])
+async def start_challenge(message: types.Message):
+    global start_date, end_date
+    start_date = datetime.now()
+    end_date = datetime(2025, 12, 9)
+    await message.reply(f"🚀 Поехали! Челлендж начат! Финал этой пьянки без алкоголя: {end_date.strftime('%d.%m.%Y')} 🏁")
+
+@dp.message_handler(commands=["join"])
+async def join_challenge(message: types.Message):
+    user = message.from_user
+    if user.id not in participants:
+        participants[user.id] = {"name": user.full_name, "drinks": 0}
+        await message.reply(f"🍵 {user.full_name}, добро пожаловать в клуб трезвых единорогов! 🦄")
+    else:
+        await message.reply("😎 Ты уже в деле, не хитри!")
+
+@dp.message_handler(commands=["stats"])
+async def stats(message: types.Message):
+    if not participants:
+        await message.reply("🤷 Пока никто не решился присоединиться к нашему трезвому движу.")
+        return
+    days_left = (end_date - datetime.now()).days
+    stats_message = f"⏳ До конца осталось: {days_left} дней. Держимся, ребята!\n\n"
+    for user_id, data in participants.items():
+        stats_message += f"🍺 {data['name']}: {data['drinks']} раз(а) сорвался(ась).\n"
+    await message.reply(stats_message)
+
+@dp.message_handler(commands=["report"])
+async def report(message: types.Message):
+    user = message.from_user
+    if user.id in participants:
+        participants[user.id]["drinks"] += 1
+        await message.reply("📉 Эх, ну ты и сорвался! Записал. Попробуй больше не пить. 🫣")
+    else:
+        await message.reply("🤔 Ты ещё не участвуешь. Напиши /join, чтобы вступить!")
+
+# Запуск бота
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
+
