@@ -16,7 +16,7 @@ dp = Dispatcher()
 start_date = datetime(2025, 1, 15)
 end_date = datetime(2025, 12, 9)
 active_chats = set()
-daily_poll_time = "22:00"  # Время отправки опроса (в формате HH:MM)
+daily_poll_time = "22:45"  # Время отправки опроса (в формате HH:MM)
 
 # Инициализация базы данных
 async def init_db():
@@ -51,6 +51,32 @@ async def get_stats():
     async with aiosqlite.connect("participants.db") as db:
         async with db.execute("SELECT * FROM participants") as cursor:
             return await cursor.fetchall()
+
+# Функция для отправки ежедневных опросов
+async def send_daily_poll():
+    while True:
+        now = datetime.now()
+        target_time = datetime.strptime(daily_poll_time, "%H:%M").time()
+        target_datetime = datetime.combine(now.date(), target_time)
+
+        # Если текущее время уже позже целевого, переносим отправку на следующий день
+        if now.time() > target_time:
+            target_datetime += timedelta(days=1)
+
+        # Рассчитать задержку до отправки
+        delay = (target_datetime - now).total_seconds()
+        print(f"Следующий опрос будет отправлен через {delay} секунд")
+        await asyncio.sleep(delay)
+
+        # Отправка опроса в активные чаты
+        for chat_id in active_chats:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Не пил 🍵", callback_data="not_drink"),
+                    InlineKeyboardButton(text="Пил 🍺", callback_data="drink")
+                ]
+            ])
+            await bot.send_message(chat_id, "🔥 Ежедневный опрос: пил ли ты сегодня?", reply_markup=keyboard)
 
 # Приветственное сообщение
 @dp.message(Command(commands=["start"]))
@@ -132,8 +158,19 @@ async def show_conditions(message: Message):
         f"Мы не пьём с {start_date.strftime('%d.%m.%Y')} до {end_date.strftime('%d.%m.%Y')}!\n"
         "Возможны отступления — не чаще 1 раза в 2 месяца, \n"
         "по очень уважительной причине (праздник, ужин с Бихером).\n"
-        "Штраф проигравшему: 1🍋!!!."
+        "Штраф: 1🍋 за каждое нарушение."
     )
+
+# Обработка ответов на опрос
+@dp.callback_query(lambda c: c.data in ["not_drink", "drink"])
+async def handle_poll_response(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if c.data == "not_drink":
+        await update_stat(user_id, "check_ins")
+        await callback.answer("🎉 Молодец, держись дальше!")
+    elif c.data == "drink":
+        await update_stat(user_id, "drinks")
+        await callback.answer("📉 Записал. Не сдавайся, завтра новый день!")
 
 # Основная функция для запуска бота
 async def main():
@@ -146,8 +183,10 @@ async def main():
     dp.message.register(report, Command(commands=["report"]))
     dp.message.register(mark_sober, Command(commands=["mark_sober"]))
     dp.message.register(show_conditions, Command(commands=["conditions"]))
+    dp.callback_query.register(handle_poll_response, lambda c: c.data in ["not_drink", "drink"])
 
     print("Бот запущен!")
+    asyncio.create_task(send_daily_poll())  # Запуск отправки опросов
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
