@@ -17,7 +17,7 @@ dp = Dispatcher()
 start_date = datetime(2025, 1, 15)
 end_date = datetime(2025, 12, 9)
 active_chats = set()
-daily_poll_time = "23:00"  # Время отправки опроса (в формате HH:MM)
+daily_poll_time = "23:05"  # Время отправки опроса (в формате HH:MM)
 timezone_moscow = pytz.timezone("Europe/Moscow")  # Часовой пояс Москвы
 
 # Инициализация базы данных
