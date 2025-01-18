@@ -3,6 +3,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from datetime import datetime, timedelta
+import pytz
 import aiosqlite
 
 # Токен бота
@@ -16,7 +17,8 @@ dp = Dispatcher()
 start_date = datetime(2025, 1, 15)
 end_date = datetime(2025, 12, 9)
 active_chats = set()
-daily_poll_time = "22:45"  # Время отправки опроса (в формате HH:MM)
+daily_poll_time = "23:00"  # Время отправки опроса (в формате HH:MM)
+timezone_moscow = pytz.timezone("Europe/Moscow")  # Часовой пояс Москвы
 
 # Инициализация базы данных
 async def init_db():
@@ -55,9 +57,9 @@ async def get_stats():
 # Функция для отправки ежедневных опросов
 async def send_daily_poll():
     while True:
-        now = datetime.now()
+        now = datetime.now(timezone_moscow)
         target_time = datetime.strptime(daily_poll_time, "%H:%M").time()
-        target_datetime = datetime.combine(now.date(), target_time)
+        target_datetime = timezone_moscow.localize(datetime.combine(now.date(), target_time))
 
         # Если текущее время уже позже целевого, переносим отправку на следующий день
         if now.time() > target_time:
@@ -158,7 +160,7 @@ async def show_conditions(message: Message):
         f"Мы не пьём с {start_date.strftime('%d.%m.%Y')} до {end_date.strftime('%d.%m.%Y')}!\n"
         "Возможны отступления — не чаще 1 раза в 2 месяца, \n"
         "по очень уважительной причине (праздник, ужин с Бихером).\n"
-        "Штраф: 1🍋 за каждое нарушение."
+        "Штраф: 1🍋!!!"
     )
 
 # Обработка ответов на опрос
