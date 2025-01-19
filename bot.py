@@ -17,7 +17,7 @@ import aiosqlite
 
 # ---------- НАСТРОЙКИ ----------
 
-BOT_TOKEN = "YOUR_BOT_TOKEN"  # <-- Подставь реальный токен
+BOT_TOKEN = "7926233927:AAFjSBeFDgrjENeTb-d8pxvUfb0hlv9YF94" 
 
 # Храним базу в /data (если у тебя на Render примонтирован Volume)
 DB_PATH = os.getenv("DB_PATH", "/data/participants.db")
