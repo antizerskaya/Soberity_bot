@@ -17,8 +17,7 @@ import aiosqlite
 
 # =================== НАСТРОЙКИ ===================
 
-BOT_TOKEN = "7926233927:AAFjSBeFDgrjENeTb-d8pxvUfb0hlv9YF94
-"
+BOT_TOKEN = "7926233927:AAFjSBeFDgrjENeTb-d8pxvUfb0hlv9YF94"
 
 # Путь к базе. Если на Render сделан Volume с mount path /data,
 # то удобно хранить базу в "/data/participants.db".
