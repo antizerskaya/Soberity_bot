@@ -1,3 +1,4 @@
+import os
 import asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -8,106 +9,164 @@ from aiogram.types import (
     CallbackQuery,
     ChatMemberUpdated
 )
+import aiosqlite
 from datetime import datetime, timedelta
 import pytz
-import aiosqlite
 
-BOT_TOKEN = "7926233927:AAFjSBeFDgrjENeTb-d8pxvUfb0hlv9YF94"  # Вставь сюда свой токен
+# === НАСТРОЙКИ БОТА ===
+
+BOT_TOKEN = "7926233927:AAFjSBeFDgrjENeTb-d8pxvUfb0hlv9YF94"  # Подставь реальный токен
+
+# Путь к базе. Можно задать в переменных окружения (Render → Settings → Environment):
+# Если не задано, по умолчанию /data/participants.db
+DB_PATH = os.getenv("DB_PATH", "/data/participants.db")
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- Параметры челленджа ---
-start_date = datetime(2025, 1, 15)
-end_date   = datetime(2025, 12, 9)
-
-# Часовой пояс Москвы
+# Если нужен учёт времени по Москве
 timezone_moscow = pytz.timezone("Europe/Moscow")
 
-# Время отправки опроса (формат "HH:MM")
-daily_poll_time = "15:30"
+# Время отправки опроса (HH:MM, московское)
+daily_poll_time = "16:55"
 
-# Множество чатов, куда шлём ежедневный опрос
-# Оно будет загружаться из базы при старте, чтобы не теряться при перезапусках.
-active_chats = set()
-
-# --- ИНИЦИАЛИЗАЦИЯ БД ---
+# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ===
 
 async def init_db():
-    """Создаём таблицы, если ещё не созданы."""
-    async with aiosqlite.connect("participants.db") as db:
-        # Таблица с участниками
+    """
+    Создаёт нужные таблицы (если их ещё нет):
+      1) chat_settings — для хранения дат челленджа и статуса чата
+      2) participants  — для учёта участников по каждому чату
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Таблица с настройками каждого чата
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id    INTEGER PRIMARY KEY,
+                start_date TEXT,
+                end_date   TEXT,
+                conditions TEXT,
+                active     INTEGER DEFAULT 0
+            )
+        """)
+        # Таблица с участниками (у каждого чата своя статистика)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS participants (
-                user_id   INTEGER PRIMARY KEY,
-                name      TEXT,
-                drinks    INTEGER DEFAULT 0,
-                check_ins INTEGER DEFAULT 0
+                row_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    INTEGER,
+                user_id    INTEGER,
+                name       TEXT,
+                drinks     INTEGER DEFAULT 0,
+                check_ins  INTEGER DEFAULT 0,
+                UNIQUE(chat_id, user_id)
             )
         """)
-        # Таблица с активными чатами
+        await db.commit()
+
+async def add_or_update_chat(chat_id: int, start_date_str: str, end_date_str: str, conditions: str = None):
+    """
+    Добавляем/обновляем запись о чате: (start_date, end_date, conditions).
+    При этом ставим active=1 (то есть челлендж включён).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS active_chats (
-                chat_id INTEGER PRIMARY KEY
-            )
-        """)
+            INSERT INTO chat_settings (chat_id, start_date, end_date, conditions, active)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                start_date=excluded.start_date,
+                end_date=excluded.end_date,
+                conditions=excluded.conditions,
+                active=1
+        """, (chat_id, start_date_str, end_date_str, conditions if conditions else ""))
         await db.commit()
 
-async def load_active_chats():
-    """Загружаем список чатов из таблицы active_chats в память."""
-    loaded_chats = set()
-    async with aiosqlite.connect("participants.db") as db:
-        async with db.execute("SELECT chat_id FROM active_chats") as cursor:
+async def load_chat_settings(chat_id: int):
+    """
+    Возвращаем (start_date, end_date, conditions, active) для чата, или None, если чата нет в базе.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT start_date, end_date, conditions, active FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        row = await cursor.fetchone()
+        return row  # (start_date, end_date, conditions, active) или None
+
+async def set_chat_active(chat_id: int, active: bool):
+    """
+    Устанавливаем active=1 или 0 для заданного чата.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        val = 1 if active else 0
+        await db.execute("UPDATE chat_settings SET active = ? WHERE chat_id = ?", (val, chat_id))
+        await db.commit()
+
+async def get_all_active_chats():
+    """
+    Получаем список chat_id, где active=1 (туда шлём ежедневные опросы).
+    """
+    results = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT chat_id FROM chat_settings WHERE active = 1") as cursor:
             async for row in cursor:
-                loaded_chats.add(row[0])
-    return loaded_chats
+                results.append(row[0])
+    return results
 
-async def add_chat(chat_id: int):
-    """Добавляем чат в БД (active_chats)."""
-    async with aiosqlite.connect("participants.db") as db:
-        await db.execute("INSERT OR IGNORE INTO active_chats (chat_id) VALUES (?)", (chat_id,))
+# === Участники (таблица participants) ===
+
+async def add_participant(chat_id: int, user_id: int, name: str):
+    """
+    Добавляем участника (chat_id + user_id). Если уже есть, игнорируем.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO participants (chat_id, user_id, name)
+            VALUES (?, ?, ?)
+        """, (chat_id, user_id, name))
         await db.commit()
 
-# --- РАБОТА С УЧАСТНИКАМИ ---
-
-async def add_participant(user_id: int, name: str):
-    """Добавляем участника в базу (participants), если его там нет."""
-    async with aiosqlite.connect("participants.db") as db:
+async def update_stat(chat_id: int, user_id: int, column: str):
+    """
+    Увеличиваем drinks или check_ins на 1 для (chat_id, user_id).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO participants (user_id, name) VALUES (?, ?)",
-            (user_id, name),
+            f"UPDATE participants SET {column} = {column} + 1 WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id)
         )
         await db.commit()
 
-async def update_stat(user_id: int, column: str):
-    """Увеличиваем drinks или check_ins на 1 для конкретного участника."""
-    async with aiosqlite.connect("participants.db") as db:
-        await db.execute(f"UPDATE participants SET {column} = {column} + 1 WHERE user_id = ?", (user_id,))
-        await db.commit()
-
-async def get_stats():
-    """Возвращаем полный список участников: (user_id, name, drinks, check_ins)."""
-    async with aiosqlite.connect("participants.db") as db:
-        async with db.execute("SELECT * FROM participants") as cursor:
+async def get_stats_for_chat(chat_id: int):
+    """
+    Список участников заданного чата (chat_id).
+    Возвращаем list[(user_id, name, drinks, check_ins), ...].
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, name, drinks, check_ins FROM participants WHERE chat_id = ?",
+            (chat_id,)
+        ) as cursor:
             return await cursor.fetchall()
 
-# --- ФУНКЦИЯ ДЛЯ ЕЖЕДНЕВНОЙ РАССЫЛКИ ОПРОСА ---
+# === ФУНКЦИЯ ЕЖЕДНЕВНОЙ РАССЫЛКИ ОПРОСА ===
 
 async def send_daily_poll():
-    """Бесконечный цикл: ждёт до daily_poll_time по Мск, рассылает опросы."""
+    """
+    Бесконечный цикл: ждём времени daily_poll_time, потом рассылаем опрос во все чаты, где active=1.
+    """
     while True:
         now = datetime.now(timezone_moscow)
         target_time = datetime.strptime(daily_poll_time, "%H:%M").time()
         target_datetime = timezone_moscow.localize(datetime.combine(now.date(), target_time))
 
-        # Если текущее время уже позже целевого — сдвигаем отправку на сутки вперёд
+        # Если текущее время уже позже целевого — переносим на следующий день
         if now.time() > target_time:
             target_datetime += timedelta(days=1)
 
         delay = (target_datetime - now).total_seconds()
-        print(f"[LOG] Следующий опрос будет отправлен через {delay} секунд.")
+        print(f"[LOG] Следующий опрос будет отправлен через {delay:.0f} секунд.")
         await asyncio.sleep(delay)
 
-        # Рассылка во все активные чаты
+        # Достаём все активные чаты (active=1)
+        active_chats = await get_all_active_chats()
+
         for chat_id in active_chats:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [
@@ -118,168 +177,236 @@ async def send_daily_poll():
             try:
                 await bot.send_message(chat_id, "🔥 Ежедневный опрос: пил ли ты сегодня?", reply_markup=keyboard)
             except Exception as e:
-                print(f"[ERROR] Не удалось отправить сообщение в чат {chat_id}: {e}")
+                print(f"[ERROR] Не удалось отправить опрос в чат {chat_id}: {e}")
 
-# --- ХЕНДЛЕРЫ ---
+# === ХЕНДЛЕРЫ ===
 
 @dp.my_chat_member()
 async def bot_added_to_group(update: ChatMemberUpdated):
     """
-    Срабатывает, когда статус бота в группе меняется.
-    Если бот был кикнут/left, а теперь member/administrator — значит, бота добавили в группу.
-    Здесь же можно автоматически добавлять чат в список рассылок.
+    Когда бота добавляют в группу (или раскикивают).
+    Создаём запись в chat_settings (если нет), но пока active=0.
     """
     if update.new_chat_member.user.id == (await bot.me()).id:
         old_status = update.old_chat_member.status
         new_status = update.new_chat_member.status
         if old_status in ("kicked", "left") and new_status in ("member", "administrator"):
             chat_id = update.chat.id
+            row = await load_chat_settings(chat_id)
+            if not row:
+                # Создаём запись для этого чата, но не включаем (active=0).
+                await add_or_update_chat(chat_id, "", "", "")
+                await set_chat_active(chat_id, False)
 
-            # Добавляем чат в список активных
-            active_chats.add(chat_id)
-            await add_chat(chat_id)
-
-            # Приветственное сообщение
             await bot.send_message(
                 chat_id,
-                "Всем привет! Я бот для трезвого челленджа.\n"
-                "Я уже занёс этот чат в список для ежедневных опросов."
+                "Привет! Я бот для трезвого челленджа.\n"
+                "Запусти соревнование в этом чате командой: /start_challenge YYYY-MM-DD YYYY-MM-DD\n"
+                "Или посмотри /help, чтобы узнать больше."
             )
 
 @dp.message(Command(commands=["start"]))
 async def cmd_start(message: Message):
-    """Приветствие по команде /start."""
+    """
+    Приветственное сообщение по /start (в ЛС или в группе).
+    """
     await message.answer(
         "Привет! Я бот для трезвого челленджа. 🎉\n\n"
-        "Вот что я умею:\n"
-        "• /start_challenge — начать челлендж (добавляет группу в список для ежедневных опросов)\n"
-        "• /join — присоединиться к челленджу\n"
-        "• /stats — посмотреть статистику\n"
-        "• /report — зафиксировать приём алкоголя\n"
-        "• /mark_sober — отметить трезвый день\n"
-        "• /conditions — посмотреть условия челленджа\n"
-        "• /help — показать список команд\n\n"
-        "Добавь меня в группу, и я буду помогать всем держаться!"
+        "Команды:\n"
+        "• /start_challenge YYYY-MM-DD YYYY-MM-DD — Запустить челлендж в этом чате\n"
+        "• /join — Присоединиться к челленджу\n"
+        "• /stats — Посмотреть статистику\n"
+        "• /report — Зафиксировать приём алкоголя\n"
+        "• /mark_sober — Отметить трезвый день\n"
+        "• /conditions — Посмотреть или задать условия\n"
+        "• /help — Показать список команд\n"
     )
 
 @dp.message(Command(commands=["help"]))
 async def cmd_help(message: Message):
-    """Справка по команде /help."""
-    await message.answer(
+    text = (
         "Команды бота:\n"
-        "/start_challenge — Запустить челлендж (начать ежедневные опросы в этом чате)\n"
-        "/join — Присоединиться к челленджу\n"
-        "/stats — Статистика участников\n"
-        "/report — Сообщить о приёме алкоголя\n"
-        "/mark_sober — Отметить трезвый день\n"
-        "/conditions — Посмотреть условия челленджа\n"
-        "/help — Показать это сообщение\n"
+        "/start_challenge YYYY-MM-DD YYYY-MM-DD — Запуск/обновление челленджа (даты)\n"
+        "/join — Присоединиться к челленджу в этом чате\n"
+        "/stats — Статистика участников по этому чату\n"
+        "/report — Сообщить о срыве (drinks + 1)\n"
+        "/mark_sober — Отметить трезвый день (check_ins + 1)\n"
+        "/conditions — Показать/изменить текст условий (например: /conditions Новые правила...)\n"
+        "/help — Это сообщение\n"
     )
+    await message.answer(text)
 
 @dp.message(Command(commands=["start_challenge"]))
 async def cmd_start_challenge(message: Message):
     """
-    Команда для ручного запуска рассылки в данном чате.  
-    Если хочешь, чтобы чат автоматически добавлялся при добавлении бота,
-    в принципе, можно не вызывать эту команду. Но пусть будет.
+    Команда для запуска (или обновления) челленджа в этом чате.
+    Использование: /start_challenge YYYY-MM-DD YYYY-MM-DD
+    Пример: /start_challenge 2025-01-15 2025-12-09
     """
+    parts = message.text.strip().split()
+    if len(parts) < 3:
+        await message.answer("Формат: /start_challenge 2025-01-15 2025-12-09")
+        return
+
+    start_date_str = parts[1]
+    end_date_str   = parts[2]
+    # Можно проверить, что это валидные даты:
+    try:
+        datetime.strptime(start_date_str, "%Y-%m-%d")
+        datetime.strptime(end_date_str,   "%Y-%m-%d")
+    except ValueError:
+        await message.answer("Неверный формат дат. Используй YYYY-MM-DD.")
+        return
+
     chat_id = message.chat.id
-    active_chats.add(chat_id)
-    await add_chat(chat_id)
+    # Записываем в chat_settings
+    await add_or_update_chat(chat_id, start_date_str, end_date_str)
+    # Ставим active=1
+    await set_chat_active(chat_id, True)
+
     await message.answer(
         f"🚀 Челлендж запущен!\n"
-        f"Период: c {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')}. 🏁\n"
-        f"Каждый день я буду присылать опрос в {daily_poll_time} по Москве."
+        f"Период: {start_date_str} - {end_date_str}.\n"
+        f"Я буду присылать опрос каждый день в {daily_poll_time} (по Москве)."
     )
 
 @dp.message(Command(commands=["join"]))
 async def cmd_join(message: Message):
-    """Команда /join — пользователь регистрируется как участник."""
+    """
+    Пользователь регистрируется как участник в этом чате.
+    """
+    chat_id = message.chat.id
     user = message.from_user
-    await add_participant(user.id, user.full_name)
-    await message.answer(
-        f"🍵 {user.full_name}, добро пожаловать в клуб трезвых единорогов! 🦄"
-    )
+    await add_participant(chat_id, user.id, user.full_name)
+    await message.answer(f"🍵 {user.full_name}, добро пожаловать в трезвый челлендж этого чата!")
 
 @dp.message(Command(commands=["stats"]))
 async def cmd_stats(message: Message):
-    """Команда /stats — показать общую статистику."""
-    all_stats = await get_stats()
-    if not all_stats:
-        await message.answer("🤷 Пока никто не присоединился к нашему трезвому движу.")
+    """
+    Показать статистику конкретно по текущему чату:
+      - Даты челленджа (start_date, end_date)
+      - Сколько дней прошло и осталось
+      - Список участников
+    """
+    chat_id = message.chat.id
+    chat_settings = await load_chat_settings(chat_id)
+    if not chat_settings:
+        await message.answer("В этом чате ещё не настроен челлендж (используй /start_challenge).")
         return
 
+    start_date_str, end_date_str, conditions, active = chat_settings
+    # Преобразуем строки в даты (если они не пустые)
+    try:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+    except:
+        start_dt = datetime.now()
+
+    try:
+        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+    except:
+        end_dt = datetime.now()
+
     now = datetime.now()
-    days_passed = (now - start_date).days
+    days_passed = (now - start_dt).days
     if days_passed < 0:
         days_passed = 0
-    days_left = (end_date - now).days
+    days_left = (end_dt - now).days
     if days_left < 0:
         days_left = 0
 
-    stats_msg = (
-        f"⏳ С начала челленджа прошло: {days_passed} дней.\n"
-        f"До конца осталось: {days_left} дней.\n\n"
+    # Выгружаем участников этого чата
+    stats = await get_stats_for_chat(chat_id)
+    if not stats:
+        await message.answer("Пока никто не присоединился (/join).")
+        return
+
+    msg = (
+        f"Статистика чата {chat_id}:\n"
+        f"Период: {start_date_str} - {end_date_str}\n"
+        f"⏳ Прошло: {days_passed} дней, осталось: {days_left} дней.\n\n"
     )
+    for (user_id, name, drinks, check_ins) in stats:
+        msg += f"• {name} — сорвался: {drinks}, трезвых дней: {check_ins}\n"
 
-    for user_id, name, drinks, check_ins in all_stats:
-        stats_msg += f"🍺 {name}: {drinks} раз(а) сорвался(ась), {check_ins} трезвых отметок.\n"
-
-    await message.answer(stats_msg)
+    await message.answer(msg)
 
 @dp.message(Command(commands=["report"]))
 async def cmd_report(message: Message):
-    """Команда /report — пользователь признаёт «срыв» (drinks += 1)."""
+    """
+    Отмечаем срыв (drinks += 1) для пользователя в этом чате.
+    """
+    chat_id = message.chat.id
     user_id = message.from_user.id
-    await update_stat(user_id, "drinks")
-    await message.answer("📉 Факт распития отмечен! Старайся держаться дальше. 🫣")
+    await update_stat(chat_id, user_id, "drinks")
+    await message.answer("📉 Отметил срыв. Не сдавайся, завтра — новый день!")
 
 @dp.message(Command(commands=["mark_sober"]))
 async def cmd_mark_sober(message: Message):
-    """Команда /mark_sober — пользователь отмечает трезвый день (check_ins += 1)."""
+    """
+    Отмечаем трезвый день (check_ins += 1) для пользователя в этом чате.
+    """
+    chat_id = message.chat.id
     user_id = message.from_user.id
-    await update_stat(user_id, "check_ins")
-    await message.answer("🎉 Отлично, трезвый день записан! Так держать! 🍵")
+    await update_stat(chat_id, user_id, "check_ins")
+    await message.answer("🎉 Трезвый день записан! Так держать!")
 
 @dp.message(Command(commands=["conditions"]))
 async def cmd_conditions(message: Message):
-    """Команда /conditions — показать условия челленджа."""
-    await message.answer(
-        "💪 Условия челленджа:\n"
-        f"Мы не пьём с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')}!\n\n"
-        "• Возможны отступления: не чаще 1 раза в 2 месяца,\n"
-        "  по очень уважительной причине (праздник, ужин с Бихером).\n"
-        "• За каждый срыв — штраф: 1🍋!!!"
-    )
+    """
+    Посмотреть или задать условия челленджа в этом чате.
+    Пример: /conditions => покажет текущие
+             /conditions Новые условия... => запишет новые
+    """
+    chat_id = message.chat.id
+    text = message.text.strip()
+    parts = text.split(maxsplit=1)
+
+    chat_settings = await load_chat_settings(chat_id)
+    if not chat_settings:
+        await message.answer("В этом чате ещё не настроен челлендж. Сначала /start_challenge.")
+        return
+
+    start_date_str, end_date_str, old_conditions, active = chat_settings
+
+    if len(parts) > 1:
+        new_conds = parts[1].strip()
+        await add_or_update_chat(chat_id, start_date_str, end_date_str, new_conds)
+        await message.answer(f"Условия обновлены:\n{new_conds}")
+    else:
+        if old_conditions:
+            await message.answer(f"Условия челленджа:\n{old_conditions}")
+        else:
+            await message.answer(
+                "Пока нет условий. Задай так:\n"
+                '/conditions Условие 1, Условие 2, Штраф за срыв = 1 лимон...'
+            )
 
 @dp.callback_query(F.data.in_({"not_drink", "drink"}))
 async def handle_poll_response(callback: CallbackQuery):
     """
-    Обработчик инлайн-кнопок «Не пил 🍵» / «Пил 🍺» из ежедневного опроса.
-    При нажатии обновляет статистику (check_ins или drinks).
+    Обработка кнопок "Не пил 🍵" / "Пил 🍺".
+    Отлично подходит для ежедневного опроса, где у каждого чата своя статистика.
     """
     user_id = callback.from_user.id
-    action = callback.data
+    chat_id = callback.message.chat.id  # чат, из которого кнопка нажата
 
-    if action == "not_drink":
-        await update_stat(user_id, "check_ins")
+    if callback.data == "not_drink":
+        await update_stat(chat_id, user_id, "check_ins")
         await callback.answer("🎉 Молодец, держись дальше!")
-    elif action == "drink":
-        await update_stat(user_id, "drinks")
+    else:  # "drink"
+        await update_stat(chat_id, user_id, "drinks")
         await callback.answer("📉 Записал. Завтра — новый день!")
 
-# --- ТОЧКА ВХОДА ---
+# === ЗАПУСК БОТА ===
 
 async def main():
-    await init_db()  # Создаём таблицы, если надо
-    global active_chats
-    active_chats = await load_active_chats()  # Загружаем из БД список чатов
-
+    await init_db()  # создаём таблицы (если нет)
     print("Бот запущен и готов к работе!")
-    # Отдельной задачей запускаем цикл, который ежедневно шлёт опрос
+
+    # Стартуем фоновую задачу, которая шлёт ежедневные опросы
     asyncio.create_task(send_daily_poll())
 
-    # Запускаем поллинг (бот будет получать апдейты)
+    # Запускаем поллинг (читаем обновления от Telegram)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
